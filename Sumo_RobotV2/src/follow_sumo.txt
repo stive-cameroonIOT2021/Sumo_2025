@@ -1,0 +1,254 @@
+#include <Arduino.h>
+
+#include "ProximityUltrasonic.h"
+#include "MotorDriver.h"
+
+/* ===================== PINS (GLOBAL) ===================== */
+constexpr uint8_t LEFT_MOTOR_IN1_PIN  = 7;
+constexpr uint8_t LEFT_MOTOR_IN2_PIN  = 8;
+constexpr uint8_t LEFT_MOTOR_PWM_PIN  = 5;
+
+constexpr uint8_t RIGHT_MOTOR_IN1_PIN = 9;
+constexpr uint8_t RIGHT_MOTOR_IN2_PIN = 10;
+constexpr uint8_t RIGHT_MOTOR_PWM_PIN = 6;
+
+constexpr uint8_t PIN_TRIG        = 12;
+constexpr uint8_t PIN_ECHO_LEFT   = A0;
+constexpr uint8_t PIN_ECHO_FRONT  = A1;
+constexpr uint8_t PIN_ECHO_RIGHT  = A2;
+
+constexpr bool INVERT_LEFT_MOTOR  = false;
+constexpr bool INVERT_RIGHT_MOTOR = false;
+
+/* ===================== TUNING (GLOBAL) ===================== */
+// Ultrasonic driver tuning
+constexpr uint16_t US_MAX_DISTANCE_CM       = 200;
+constexpr uint16_t US_MIN_VALID_CM          = 2;
+constexpr uint32_t US_TRIGGER_PERIOD_MS     = 50;
+constexpr uint32_t US_STALE_FORCE_FAR_MS    = 250;
+
+// Detection ranges
+constexpr float DETECT_FRONT_CM             = 20.0f;
+constexpr float DETECT_SIDE_CM              = 20.0f;
+
+// Touch & push behavior
+constexpr float CLOSE_ZONE_CM               = 7.0f;
+constexpr int16_t SPEED_PUSH_WHEN_CLOSE     = 140;
+
+// Follow speed mapping (closer = faster)
+constexpr int16_t SPEED_MIN_FOLLOW          = 90;
+constexpr int16_t SPEED_MAX_FOLLOW          = 210;
+constexpr float   SPEED_FULL_AT_CM          = 10.0f;   // <= this => max speed
+constexpr float   SPEED_MIN_AT_CM           = 90.0f;   // >= this => min speed
+
+// Turning
+constexpr int16_t SPEED_TURN_TO_SIDE        = 140;
+
+// Steering (center target)
+constexpr float   STEER_GAIN                = 2.0f;
+constexpr int16_t STEER_LIMIT               = 90;
+
+// Lock-on timing (fix 90° side sensor loss)
+constexpr uint32_t TURN_COMMIT_MS           = 220;  // keep turning even if side loses target
+constexpr uint32_t FRONT_CONFIRM_MS         = 80;   // front must be stable this long to "acquire"
+constexpr uint32_t LOCKON_TIMEOUT_MS        = 900;  // give up lock-on if never acquired
+
+// Behavior: stop when nothing detected
+constexpr bool STOP_WHEN_NOTHING_SEEN       = true;
+
+// Debug
+constexpr uint32_t SERIAL_PERIOD_MS         = 100;
+
+/* ===================== OBJECTS (GLOBAL) ===================== */
+MotorDriver motors(
+  MotorDriver::MotorPins{ LEFT_MOTOR_PWM_PIN,  LEFT_MOTOR_IN1_PIN,  LEFT_MOTOR_IN2_PIN },
+  MotorDriver::MotorPins{ RIGHT_MOTOR_PWM_PIN, RIGHT_MOTOR_IN1_PIN, RIGHT_MOTOR_IN2_PIN }
+);
+
+ProximityUltrasonic prox(PIN_TRIG, PIN_ECHO_LEFT, PIN_ECHO_FRONT, PIN_ECHO_RIGHT);
+
+/* ===================== STATE (GLOBAL) ===================== */
+uint32_t g_lastSerialMs = 0;
+
+enum RobotMode : uint8_t { MODE_IDLE = 0, MODE_LOCKON = 1, MODE_ATTACK = 2 };
+RobotMode g_mode = MODE_IDLE;
+
+int8_t   g_lockTurnDir = 0;              // -1 = left, +1 = right
+uint32_t g_lockStartMs = 0;
+uint32_t g_turnCommitUntilMs = 0;
+
+uint32_t g_frontSeenSinceMs = 0;
+
+/* ===================== HELPERS (GLOBAL) ===================== */
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static bool frontDetected(float cm) { return (cm > 0.0f) && (cm <= DETECT_FRONT_CM); }
+static bool sideDetected(float cm)  { return (cm > 0.0f) && (cm <= DETECT_SIDE_CM); }
+
+static int16_t followSpeedFromFront(float frontCm) {
+  const float d = clampf(frontCm, SPEED_FULL_AT_CM, SPEED_MIN_AT_CM);
+  const float t  = (d - SPEED_FULL_AT_CM) / (SPEED_MIN_AT_CM - SPEED_FULL_AT_CM); // 0..1
+  const float sp = (1.0f - t) * (float)SPEED_MAX_FOLLOW + t * (float)SPEED_MIN_FOLLOW;
+  return (int16_t)clampi((int16_t)(sp + 0.5f), SPEED_MIN_FOLLOW, SPEED_MAX_FOLLOW);
+}
+
+static int16_t computeTurnFromSides(float leftCm, float rightCm) {
+  // If steering is reversed on your robot, flip sign:
+  // const float err = (rightCm - leftCm);
+  const float err = (leftCm - rightCm);
+  int16_t turn = (int16_t)(err * STEER_GAIN);
+  return clampi(turn, -STEER_LIMIT, STEER_LIMIT);
+}
+
+static void driveArcade(int16_t forward, int16_t turn) {
+  const int16_t L = (int16_t)(forward - turn);
+  const int16_t R = (int16_t)(forward + turn);
+  motors.drive(clampi(L, -255, 255), clampi(R, -255, 255));
+}
+
+static void turnInPlaceDir(int8_t dir, int16_t speedAbs) {
+  const int16_t s = clampi(speedAbs, 0, 255);
+  if (dir < 0) motors.drive(-s, +s);  // left
+  else         motors.drive(+s, -s);  // right
+}
+
+/* ===================== SETUP/LOOP ===================== */
+void setup() {
+  Serial.begin(115200);
+
+  motors.begin();
+  motors.setInvert(INVERT_LEFT_MOTOR, INVERT_RIGHT_MOTOR);
+
+  prox.begin();
+  prox.setMaxDistanceCm(US_MAX_DISTANCE_CM);
+  prox.setMinValidCm(US_MIN_VALID_CM);
+  prox.setTriggerPeriodMs(US_TRIGGER_PERIOD_MS);
+  prox.setStaleForceFarMs(US_STALE_FORCE_FAR_MS);
+
+  motors.stop();
+  g_mode = MODE_IDLE;
+}
+
+void loop() {
+  prox.update(); // non-blocking
+  const auto &d = prox.getDistancesCm();
+  const uint32_t nowMs = millis();
+
+  const bool frontSeen = frontDetected(d.front);
+  const bool leftSeen  = sideDetected(d.left);
+  const bool rightSeen = sideDetected(d.right);
+
+  // Front stable confirmation (non-blocking)
+  if (frontSeen) {
+    if (g_frontSeenSinceMs == 0) g_frontSeenSinceMs = nowMs;
+  } else {
+    g_frontSeenSinceMs = 0;
+  }
+  const bool frontConfirmed =
+    (g_frontSeenSinceMs != 0) && ((nowMs - g_frontSeenSinceMs) >= FRONT_CONFIRM_MS);
+
+  /* ===================== MODE LOGIC ===================== */
+  if (g_mode == MODE_IDLE) {
+    // Nothing detected => STOP (your requirement)
+    if (!frontSeen && !leftSeen && !rightSeen) {
+      if (STOP_WHEN_NOTHING_SEEN) motors.stop();
+    }
+    // Front detected => attack
+    else if (frontSeen) {
+      g_mode = MODE_ATTACK;
+    }
+    // Side detected => lock-on (commit turn so you don't lose object)
+    else {
+      g_mode = MODE_LOCKON;
+      g_lockStartMs = nowMs;
+
+      if (leftSeen && !rightSeen)       g_lockTurnDir = -1;
+      else if (rightSeen && !leftSeen)  g_lockTurnDir = +1;
+      else                              g_lockTurnDir = (d.left < d.right) ? -1 : +1;
+
+      g_turnCommitUntilMs = nowMs + TURN_COMMIT_MS;
+      g_frontSeenSinceMs = 0;
+    }
+  }
+  else if (g_mode == MODE_LOCKON) {
+    // Timeout -> go idle (stop)
+    if ((nowMs - g_lockStartMs) >= LOCKON_TIMEOUT_MS) {
+      g_mode = MODE_IDLE;
+    } else {
+      if (frontConfirmed) {
+        g_mode = MODE_ATTACK;
+      } else {
+        const bool commitActive = (nowMs <= g_turnCommitUntilMs);
+
+        // After commit window, if one side clearly sees, update turn direction
+        if (!commitActive) {
+          if (leftSeen && !rightSeen)       g_lockTurnDir = -1;
+          else if (rightSeen && !leftSeen)  g_lockTurnDir = +1;
+          else {
+            // keep last direction
+          }
+        }
+
+        turnInPlaceDir(g_lockTurnDir, SPEED_TURN_TO_SIDE);
+      }
+    }
+  }
+  else { // MODE_ATTACK
+    if (!frontSeen) {
+      // Lost front: if a side sees, lock-on again. Otherwise stop (idle).
+      if (leftSeen || rightSeen) {
+        g_mode = MODE_LOCKON;
+        g_lockStartMs = nowMs;
+
+        if (leftSeen && !rightSeen)       g_lockTurnDir = -1;
+        else if (rightSeen && !leftSeen)  g_lockTurnDir = +1;
+        else                              g_lockTurnDir = (d.left < d.right) ? -1 : +1;
+
+        g_turnCommitUntilMs = nowMs + TURN_COMMIT_MS;
+        g_frontSeenSinceMs = 0;
+      } else {
+        g_mode = MODE_IDLE;
+      }
+    } else {
+      const int16_t turn = computeTurnFromSides(d.left, d.right);
+
+      // Touch & push: when very close, keep pushing forward (don’t back off)
+      if (d.front <= CLOSE_ZONE_CM) {
+        driveArcade(SPEED_PUSH_WHEN_CLOSE, turn);
+      } else {
+        const int16_t fwd = followSpeedFromFront(d.front);
+        driveArcade(fwd, turn);
+      }
+    }
+  }
+
+  /* ===================== DEBUG (NON-BLOCKING) ===================== */
+  if ((nowMs - g_lastSerialMs) >= SERIAL_PERIOD_MS) {
+    g_lastSerialMs = nowMs;
+
+    Serial.print(F("M="));
+    Serial.print((g_mode == MODE_IDLE) ? F("IDLE") : (g_mode == MODE_LOCKON) ? F("LOCK") : F("ATK"));
+
+    Serial.print(F("  L=")); Serial.print(d.left, 1);
+    Serial.print(F("  F=")); Serial.print(d.front, 1);
+    Serial.print(F("  R=")); Serial.print(d.right, 1);
+
+    Serial.print(F("  seen="));
+    Serial.print(frontSeen ? F("F") : F("-"));
+    Serial.print(leftSeen  ? F("L") : F("-"));
+    Serial.print(rightSeen ? F("R") : F("-"));
+
+    Serial.print(F("  dir=")); Serial.print((int)g_lockTurnDir);
+    Serial.println();
+  }
+}

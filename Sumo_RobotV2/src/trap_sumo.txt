@@ -1,0 +1,147 @@
+#include <Arduino.h>
+#include "Config.h"
+#include "MotorDriver.h"
+#include "LineSensorQTR.h"
+
+constexpr uint8_t LEFT_MOTOR_IN1_PIN  = 7;
+constexpr uint8_t LEFT_MOTOR_IN2_PIN  = 8;
+constexpr uint8_t LEFT_MOTOR_PWM_PIN  = 5;
+
+constexpr uint8_t RIGHT_MOTOR_IN1_PIN = 9;
+constexpr uint8_t RIGHT_MOTOR_IN2_PIN = 10;
+constexpr uint8_t RIGHT_MOTOR_PWM_PIN = 6;
+
+constexpr uint8_t QTR_LEFT_PIN  = 2;
+constexpr uint8_t QTR_RIGHT_PIN = 3;
+
+constexpr bool INVERT_LEFT_MOTOR  = false;
+constexpr bool INVERT_RIGHT_MOTOR = false;
+
+MotorDriver motors(
+  MotorDriver::MotorPins{ LEFT_MOTOR_PWM_PIN,  LEFT_MOTOR_IN1_PIN,  LEFT_MOTOR_IN2_PIN },
+  MotorDriver::MotorPins{ RIGHT_MOTOR_PWM_PIN, RIGHT_MOTOR_IN1_PIN, RIGHT_MOTOR_IN2_PIN }
+);
+
+LineSensorQTR qtrL(QTR_LEFT_PIN);
+LineSensorQTR qtrR(QTR_RIGHT_PIN);
+
+enum class State : uint8_t { RUN, BRAKE, BACK, TURN };
+static State g_state = State::RUN;
+
+static uint32_t g_t0 = 0;
+static uint32_t g_lastQtrMs = 0;
+
+static uint16_t g_qtrL_us = 0;
+static uint16_t g_qtrR_us = 0;
+static bool g_whiteL = false;
+static bool g_whiteR = false;
+
+// DVD diagonal direction
+static bool g_curveRight = true;
+// turn direction away from edge
+static bool g_turnRight = true;
+
+static inline void enter(State s) { g_state = s; g_t0 = millis(); }
+
+static inline bool isWhite(uint16_t tUs) {
+  return (tUs <= Config::QTR_WHITE_TH_US); // flip if needed
+}
+
+static void sampleQtrIfDue() {
+  const uint32_t now = millis();
+  if ((now - g_lastQtrMs) < Config::QTR_SAMPLE_PERIOD_MS) return;
+  g_lastQtrMs = now;
+
+  g_qtrL_us = qtrL.readUs();
+  g_qtrR_us = qtrR.readUs();
+
+  g_whiteL = isWhite(g_qtrL_us);
+  g_whiteR = isWhite(g_qtrR_us);
+
+  if (Config::DEBUG_SERIAL) {
+    Serial.print("QTR L/R us: ");
+    Serial.print(g_qtrL_us); Serial.print(" / "); Serial.print(g_qtrR_us);
+    Serial.print("  white L/R: ");
+    Serial.print(g_whiteL); Serial.print(" / "); Serial.println(g_whiteR);
+  }
+}
+
+static inline bool anyWhite() { return (g_whiteL || g_whiteR); }
+
+static void driveForwardDVD() {
+  if (g_curveRight) motors.drive(Config::FWD_FAST, Config::FWD_SLOW);
+  else             motors.drive(Config::FWD_SLOW, Config::FWD_FAST);
+}
+
+static void driveBack() {
+  motors.drive(-Config::EDGE_BACK_SPEED, -Config::EDGE_BACK_SPEED);
+}
+
+static void driveTurn() {
+  if (g_turnRight) motors.drive(+Config::EDGE_TURN_SPEED, -Config::EDGE_TURN_SPEED);
+  else            motors.drive(-Config::EDGE_TURN_SPEED, +Config::EDGE_TURN_SPEED);
+}
+
+static void computeTurnAway() {
+  // If left sees white => border is on left => turn right (away)
+  // If right sees white => turn left (away)
+  if (g_whiteL && !g_whiteR) g_turnRight = true;
+  else if (g_whiteR && !g_whiteL) g_turnRight = false;
+  else g_turnRight = !g_turnRight; // both: flip to vary
+
+  // After bounce, also flip diagonal direction to look like reflection
+  g_curveRight = g_turnRight;
+}
+
+static void tick() {
+  sampleQtrIfDue();
+  const uint32_t now = millis();
+
+  switch (g_state) {
+    case State::RUN: {
+      if (anyWhite()) {
+        computeTurnAway();
+        motors.stop();
+        enter(State::BRAKE);
+      } else {
+        driveForwardDVD();
+      }
+    } break;
+
+    case State::BRAKE: {
+      if ((now - g_t0) >= Config::EDGE_BRAKE_MS) {
+        driveBack();
+        enter(State::BACK);
+      }
+    } break;
+
+    case State::BACK: {
+      driveBack();
+      if ((now - g_t0) >= Config::EDGE_BACK_MS) {
+        driveTurn();
+        enter(State::TURN);
+      }
+    } break;
+
+    case State::TURN: {
+      driveTurn();
+      if ((now - g_t0) >= Config::EDGE_TURN_MS) {
+        enter(State::RUN);
+      }
+    } break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  motors.begin();
+  motors.setInvert(INVERT_LEFT_MOTOR, INVERT_RIGHT_MOTOR);
+  qtrL.begin();
+  qtrR.begin();
+  motors.stop();
+  enter(State::RUN);
+}
+
+void loop() {
+  tick();
+}
